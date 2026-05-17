@@ -27,6 +27,12 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 const EXCEL_FILE = path.join(__dirname, 'mykattu_leads.xlsx');
 
+// ── WARN if running on Render free tier (no persistent disk) ──────────
+if (process.env.RENDER) {
+  console.warn('⚠️  Running on Render — Excel file will be lost on redeploy!');
+  console.warn('   → Consider adding a Render Disk or exporting leads via email only.');
+}
+
 // ── CORS — allows your GitHub Pages frontend to talk to this backend ──
 app.use(cors({
   origin: [
@@ -43,6 +49,16 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static(__dirname));
 
+// ── STARTUP ENV VALIDATION ────────────────────────────────────────────
+const missingVars = [];
+if (!OWNER_EMAIL)    missingVars.push('OWNER_EMAIL');
+if (!GMAIL_USER)     missingVars.push('GMAIL_USER');
+if (!GMAIL_APP_PASS) missingVars.push('GMAIL_APP_PASS');
+if (missingVars.length) {
+  console.error('❌ Missing environment variables:', missingVars.join(', '));
+  console.error('   → Set these in Render Dashboard → Environment tab');
+}
+
 // ── NODEMAILER SETUP ──────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
   host:   'smtp.gmail.com',
@@ -52,15 +68,12 @@ const transporter = nodemailer.createTransport({
     user: GMAIL_USER,
     pass: GMAIL_APP_PASS,
   },
-  tls: {
-    rejectUnauthorized: false,
-  },
 });
 
 transporter.verify((error) => {
   if (error) {
     console.error('❌ Email setup error:', error.message);
-    console.error('   → Check GMAIL_USER and GMAIL_APP_PASS in your .env file');
+    console.error('   → Check GMAIL_USER and GMAIL_APP_PASS in Render Environment tab');
   } else {
     console.log('✅ Email ready — Gmail connected');
   }
@@ -74,7 +87,16 @@ const HEADERS = [
 
 async function appendToExcel(lead) {
   const workbook = new ExcelJS.Workbook();
-  if (fs.existsSync(EXCEL_FILE)) await workbook.xlsx.readFile(EXCEL_FILE);
+  let isNewFile = !fs.existsSync(EXCEL_FILE);
+
+  if (!isNewFile) {
+    try {
+      await workbook.xlsx.readFile(EXCEL_FILE);
+    } catch (e) {
+      console.warn('⚠️  Could not read Excel file, creating fresh one:', e.message);
+      isNewFile = true;
+    }
+  }
 
   let sheet = workbook.getWorksheet('Leads');
   if (!sheet) {
@@ -92,13 +114,17 @@ async function appendToExcel(lead) {
     });
   }
 
-  const rowNum  = sheet.rowCount;
+  // FIX: rowCount includes the header row (row 1), so data rows start at rowCount.
+  // S.No = rowCount - 1 gives correct 1-based serial number for leads only.
+  const dataRowCount = sheet.rowCount; // header is row 1, first lead will be row 2
+  const sn = dataRowCount; // S.No = existing rows (header + previous leads), so next lead = dataRowCount
+
   const now     = new Date();
   const dateStr = now.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
   const timeStr = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
 
   const dr = sheet.addRow([
-    rowNum, dateStr, timeStr,
+    sn, dateStr, timeStr,
     lead.fname   || '',
     lead.lname   || '',
     lead.phone   || '',
@@ -109,7 +135,7 @@ async function appendToExcel(lead) {
     lead.source  || 'Website Form',
   ]);
 
-  const isEven = (rowNum % 2 === 0);
+  const isEven = (sn % 2 === 0);
   dr.eachCell(cell => {
     cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: isEven ? 'FFF0F8FF' : 'FFFFFFFF' } };
     cell.border    = { bottom: { style: 'hair', color: { argb: 'FFE2E8F0' } } };
@@ -118,7 +144,7 @@ async function appendToExcel(lead) {
   dr.height = 18;
 
   await workbook.xlsx.writeFile(EXCEL_FILE);
-  return rowNum;
+  return sn;
 }
 
 // ── OWNER ALERT EMAIL ─────────────────────────────────────────────────
@@ -201,24 +227,39 @@ app.post('/api/lead', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Name and phone are required.' });
     }
 
-    const sn = await appendToExcel(lead);
-    console.log(`✅ Lead #${sn} saved: ${lead.fname} ${lead.lname} (${lead.phone})`);
+    // Save to Excel (non-fatal — don't fail the whole request if Excel fails on Render)
+    let sn = '?';
+    try {
+      sn = await appendToExcel(lead);
+      console.log(`✅ Lead #${sn} saved to Excel: ${lead.fname} ${lead.lname} (${lead.phone})`);
+    } catch (excelErr) {
+      console.error('⚠️  Excel save failed (continuing anyway):', excelErr.message);
+    }
 
+    // Send emails
     const [ownerR, userR] = await Promise.allSettled([
       sendOwnerEmail(lead, sn),
       sendUserEmail(lead),
     ]);
 
-    if (ownerR.status === 'rejected') console.error('❌ Owner email:', ownerR.reason?.message);
-    else console.log('✅ Owner email sent');
+    if (ownerR.status === 'rejected') console.error('❌ Owner email failed:', ownerR.reason?.message);
+    else console.log('✅ Owner email sent to', OWNER_EMAIL);
 
-    if (userR.status === 'rejected') console.error('❌ User email:', userR.reason?.message);
+    if (userR.status === 'rejected') console.error('❌ User email failed:', userR.reason?.message);
     else if (lead.email) console.log('✅ User email sent to', lead.email);
+
+    // If BOTH emails failed, return an error so the frontend knows
+    if (ownerR.status === 'rejected' && userR.status === 'rejected') {
+      return res.status(500).json({
+        success: false,
+        message: 'Could not send emails. Please check Gmail credentials in Render Environment tab.',
+      });
+    }
 
     res.json({ success: true, message: 'Lead saved!', serialNo: sn });
 
   } catch (err) {
-    console.error('Lead error:', err);
+    console.error('❌ Lead route error:', err);
     res.status(500).json({ success: false, message: 'Server error. Please try again.' });
   }
 });
@@ -295,13 +336,20 @@ app.post('/api/chat', (req, res) => {
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    time: new Date().toISOString(),
+    emailConfigured: !!(GMAIL_USER && GMAIL_APP_PASS),
+    ownerEmail: OWNER_EMAIL || 'NOT SET',
+  });
 });
 
 // ── START SERVER ──────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n✅ MYKATTU Backend running → http://localhost:${PORT}`);
   console.log(`📊 Excel file: ${EXCEL_FILE}`);
-  console.log(`📧 Owner email: ${OWNER_EMAIL}`);
+  console.log(`📧 Owner email: ${OWNER_EMAIL || '⚠️  NOT SET'}`);
+  console.log(`📬 Gmail user: ${GMAIL_USER || '⚠️  NOT SET'}`);
+  console.log(`🔑 Gmail pass: ${GMAIL_APP_PASS ? '✅ Set' : '⚠️  NOT SET'}`);
   console.log(`🤖 AI Chat: ${ANTHROPIC_API_KEY && ANTHROPIC_API_KEY !== 'YOUR_ANTHROPIC_API_KEY' ? 'Claude ready ✨' : '⚠️  Add ANTHROPIC_API_KEY to .env'}\n`);
 });
