@@ -27,7 +27,19 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 const EXCEL_FILE = path.join(__dirname, 'mykattu_leads.xlsx');
 
-app.use(cors());
+// ── CORS — allows your GitHub Pages frontend to talk to this backend ──
+app.use(cors({
+  origin: [
+    'https://rahul-2006ra.github.io',   // your live GitHub Pages site
+    'http://localhost:3000',             // for local development
+    'http://localhost:5500',             // for VS Code Live Server
+    'http://127.0.0.1:5500',            // for VS Code Live Server (alternate)
+  ],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+// ─────────────────────────────────────────────────────────────────────
+
 app.use(express.json());
 app.use(express.static(__dirname));
 
