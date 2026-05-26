@@ -23,9 +23,12 @@ const OWNER_EMAIL       = process.env.OWNER_EMAIL;
 const GMAIL_USER        = process.env.GMAIL_USER;
 const GMAIL_APP_PASS    = process.env.GMAIL_APP_PASS;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_MODEL   = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
 // ─────────────────────────────────────────────────────────────────────
 
 const EXCEL_FILE = path.join(__dirname, 'mykattu_leads.xlsx');
+const EMAIL_TIMEOUT_MS = Number(process.env.EMAIL_TIMEOUT_MS || 12000);
+const AI_TIMEOUT_MS    = Number(process.env.AI_TIMEOUT_MS || 20000);
 
 // ── WARN if running on Render free tier (no persistent disk) ──────────
 if (process.env.RENDER) {
@@ -60,16 +63,21 @@ if (missingVars.length) {
 }
 
 // ── NODEMAILER SETUP ──────────────────────────────────────────────────
-const transporter = nodemailer.createTransport({
+const emailConfigured = !!(OWNER_EMAIL && GMAIL_USER && GMAIL_APP_PASS);
+const transporter = emailConfigured ? nodemailer.createTransport({
   host:   'smtp.gmail.com',
   port:   465,
   secure: true,
+  connectionTimeout: EMAIL_TIMEOUT_MS,
+  greetingTimeout:   EMAIL_TIMEOUT_MS,
+  socketTimeout:     EMAIL_TIMEOUT_MS,
   auth: {
     user: GMAIL_USER,
     pass: GMAIL_APP_PASS,
   },
-});
+}) : null;
 
+if (transporter) {
 transporter.verify((error) => {
   if (error) {
     console.error('❌ Email setup error:', error.message);
@@ -78,12 +86,51 @@ transporter.verify((error) => {
     console.log('✅ Email ready — Gmail connected');
   }
 });
+}
 
 // ── EXCEL HELPER ──────────────────────────────────────────────────────
 const HEADERS = [
   'S.No', 'Date', 'Time', 'First Name', 'Last Name',
   'Phone', 'Email', 'Fitness Goal', 'Preferred Plan', 'Message', 'Source'
 ];
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function getLatestUserMessage(messages = []) {
+  const lastUser = [...messages].reverse().find(m => m && m.role === 'user');
+  return String(lastUser?.content || '').toLowerCase();
+}
+
+function localCoachReply(messages) {
+  const msg = getLatestUserMessage(messages);
+
+  if (msg.includes('time') || msg.includes('timing') || msg.includes('open') || msg.includes('hour')) {
+    return "Bro, MYKATTU GYM is open Mon-Fri 5 AM-11 PM, Sat 6 AM-10 PM, and Sun 7 AM-8 PM. Come for a free trial and we will map your plan, champ!";
+  }
+  if (msg.includes('price') || msg.includes('plan') || msg.includes('membership') || msg.includes('fee')) {
+    return "Boss, our plans are Warrior Rs.999/mo, Elite Rs.1999/mo, Legend Rs.3499/mo, and Annual Rs.29999/yr. Elite is the best value if you want AI coaching, scans, classes, and nutrition support.";
+  }
+  if (msg.includes('address') || msg.includes('location') || msg.includes('where')) {
+    return "Champ, we are at State Highway 39, opp. St. Anne's High School, T.B Cross, Hesaraghatta, Bengaluru 560088. Call or WhatsApp +91 98765 43210 and we will guide you.";
+  }
+  if (msg.includes('fat') || msg.includes('weight loss') || msg.includes('lose weight')) {
+    return "Bro, start with 3 days strength training, 2 days cardio, 8-10k steps daily, and a small calorie deficit with high protein. Book a free trial and we will build your exact fat-loss plan.";
+  }
+  if (msg.includes('muscle') || msg.includes('bulk') || msg.includes('strength')) {
+    return "Boss, focus on progressive overload, compound lifts, 1.6-2.2g protein per kg body weight, and proper sleep. Our Elite plan is great for muscle gain with AI tracking and trainer support.";
+  }
+  if (msg.includes('diet') || msg.includes('protein') || msg.includes('meal')) {
+    return "Champ, keep every meal protein-first: eggs, chicken, paneer, dal, curd, or whey, then add rice/roti and vegetables based on your goal. Tell me your weight and goal and I will suggest a simple split.";
+  }
+
+  return "Bro, I can help with workouts, diet, fat loss, muscle gain, supplements, timings, pricing, and free trial booking. Ask me your goal and I will guide you like a coach.";
+}
 
 async function appendToExcel(lead) {
   const workbook = new ExcelJS.Workbook();
@@ -149,6 +196,7 @@ async function appendToExcel(lead) {
 
 // ── OWNER ALERT EMAIL ─────────────────────────────────────────────────
 async function sendOwnerEmail(lead, sn) {
+  if (!transporter || !OWNER_EMAIL) return { skipped: true };
   await transporter.sendMail({
     from:    `"MYKATTU GYM" <${GMAIL_USER}>`,
     to:      OWNER_EMAIL,
@@ -179,6 +227,7 @@ async function sendOwnerEmail(lead, sn) {
 
 // ── USER THANK-YOU EMAIL ──────────────────────────────────────────────
 async function sendUserEmail(lead) {
+  if (!transporter) return { skipped: true };
   if (!lead.email) return;
   await transporter.sendMail({
     from:    `"MYKATTU GYM" <${GMAIL_USER}>`,
@@ -236,10 +285,10 @@ app.post('/api/lead', async (req, res) => {
       console.error('⚠️  Excel save failed (continuing anyway):', excelErr.message);
     }
 
-    // Send emails
+    // Send emails with a hard timeout so the website never hangs on SMTP.
     const [ownerR, userR] = await Promise.allSettled([
-      sendOwnerEmail(lead, sn),
-      sendUserEmail(lead),
+      withTimeout(sendOwnerEmail(lead, sn), EMAIL_TIMEOUT_MS, 'Owner email'),
+      withTimeout(sendUserEmail(lead), EMAIL_TIMEOUT_MS, 'User email'),
     ]);
 
     if (ownerR.status === 'rejected') console.error('❌ Owner email failed:', ownerR.reason?.message);
@@ -248,15 +297,22 @@ app.post('/api/lead', async (req, res) => {
     if (userR.status === 'rejected') console.error('❌ User email failed:', userR.reason?.message);
     else if (lead.email) console.log('✅ User email sent to', lead.email);
 
-    // If BOTH emails failed, return an error so the frontend knows
-    if (ownerR.status === 'rejected' && userR.status === 'rejected') {
+    // If Excel failed and both emails failed, return an error so the frontend knows.
+    // Otherwise the lead is captured and the website should show success.
+    if (sn === '?' && ownerR.status === 'rejected' && userR.status === 'rejected') {
       return res.status(500).json({
         success: false,
         message: 'Could not send emails. Please check Gmail credentials in Render Environment tab.',
       });
     }
 
-    res.json({ success: true, message: 'Lead saved!', serialNo: sn });
+    res.json({
+      success: true,
+      message: emailConfigured ? 'Lead saved!' : 'Lead saved locally. Email is not configured.',
+      serialNo: sn,
+      emailSent: (ownerR.status === 'fulfilled' && !ownerR.value?.skipped) ||
+                 (userR.status === 'fulfilled' && !userR.value?.skipped),
+    });
 
   } catch (err) {
     console.error('❌ Lead route error:', err);
@@ -273,11 +329,11 @@ app.post('/api/chat', (req, res) => {
     }
 
     if (!ANTHROPIC_API_KEY || ANTHROPIC_API_KEY === 'YOUR_ANTHROPIC_API_KEY') {
-      return res.json({ reply: "AI chat needs setup! Add your Anthropic API key to the .env file. For now call us: +91 98765 43210! 💪" });
+      return res.json({ reply: localCoachReply(messages), fallback: true });
     }
 
     const bodyData = JSON.stringify({
-      model:      'claude-haiku-4-5-20251001',
+      model:      ANTHROPIC_MODEL,
       max_tokens: 500,
       system: "You are MYKATTU AI Coach for MYKATTU GYM in Hesaraghatta, Bengaluru. " +
               "Personality: friendly energetic gym coach, call user 'bro'/'boss'/'champ', keep replies short (2-5 sentences), use fitness emojis. " +
@@ -312,17 +368,22 @@ app.post('/api/chat', (req, res) => {
             res.json({ reply: parsed.content[0].text });
           } else {
             console.error('Anthropic response:', data);
-            res.json({ reply: "Bro, AI is having a moment 😅 Try again! 💪" });
+            return res.json({ reply: localCoachReply(messages), fallback: true });
           }
         } catch (e) {
-          res.json({ reply: "AI response error. Try again! 💪" });
+          console.error('Anthropic parse error:', e.message, data);
+          return res.json({ reply: localCoachReply(messages), fallback: true });
         }
       });
     });
 
     apiReq.on('error', (e) => {
       console.error('Anthropic request error:', e.message);
-      res.json({ reply: "Can't reach AI right now. Check internet and try again! 💪" });
+      if (!res.headersSent) return res.json({ reply: localCoachReply(messages), fallback: true });
+    });
+
+    apiReq.setTimeout(AI_TIMEOUT_MS, () => {
+      apiReq.destroy(new Error(`Anthropic request timed out after ${AI_TIMEOUT_MS}ms`));
     });
 
     apiReq.write(bodyData);
@@ -330,7 +391,7 @@ app.post('/api/chat', (req, res) => {
 
   } catch (err) {
     console.error('Chat route error:', err);
-    res.json({ reply: "Something went wrong. Try again! 💪" });
+    return res.json({ reply: localCoachReply(req.body?.messages), fallback: true });
   }
 });
 
@@ -339,7 +400,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     time: new Date().toISOString(),
-    emailConfigured: !!(GMAIL_USER && GMAIL_APP_PASS),
+    emailConfigured,
     ownerEmail: OWNER_EMAIL || 'NOT SET',
   });
 });
